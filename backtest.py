@@ -1,30 +1,32 @@
 """
-backtest.py  —  Simple daily-bar backtest (no transaction costs in v1).
+backtest.py  —  Daily-bar backtest with transaction costs (v2).
 
-Position sizing (approximately dollar-neutral)
-----------------------------------------------
+New in v2
+---------
+Transaction costs
+  Every time the position changes (entry, exit, or reversal), we subtract
+  the cost of both legs:  2 × TRANSACTION_COST from that day's return.
+  This prevents the strategy from overtrading and reflects real execution.
+
+period_metrics()
+  A helper that computes Sharpe, drawdown, and return for any sub-period
+  of the results DataFrame. Used in main.py to report training-period
+  and out-of-sample performance separately.
+
+Position sizing (unchanged from v1, approximately dollar-neutral)
+-----------------------------------------------------------------
   Long  spread: long  $1 of ticker1, short $hedge_ratio of ticker2
-  Short spread: short $1 of ticker1, long  $hedge_ratio of ticker2
+  Short spread: reverse of above
+  Capital per unit = 1 + |hedge_ratio|
+  Return on capital = signal × (ret1 − β·ret2) / (1 + |β|)
 
-  Total capital deployed per unit  =  1 + |hedge_ratio|
-  Daily P&L per unit               =  signal × (ret1 − β·ret2)
-  Return on capital                =  P&L / (1 + |hedge_ratio|)
-
-Signal is lagged by 1 day to avoid look-ahead bias
-(we see today's z-score → trade at next open).
-
-Performance metrics
--------------------
-  Total return      : cumulative growth of the strategy
-  Annualised Sharpe : daily Sharpe × √252
-  Max drawdown      : worst peak-to-trough drawdown
-  Trade signals     : number of position changes
+Signal is lagged by 1 day (no look-ahead bias).
 """
 
 import numpy as np
 import pandas as pd
 
-from config import INITIAL_CAPITAL
+from config import INITIAL_CAPITAL, TRANSACTION_COST
 
 
 def run_backtest(
@@ -33,22 +35,24 @@ def run_backtest(
     ticker1: str,
     ticker2: str,
     hedge_ratio: float,
+    transaction_cost: float = TRANSACTION_COST,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Simulate the pair-trade strategy on historical prices.
 
     Parameters
     ----------
-    prices      : pd.DataFrame  columns [ticker1, ticker2]
-    signals     : pd.Series     +1 / -1 / 0
-    ticker1     : str
-    ticker2     : str
-    hedge_ratio : float         β from OLS
+    prices           : pd.DataFrame  columns [ticker1, ticker2]
+    signals          : pd.Series     +1 / -1 / 0
+    ticker1          : str
+    ticker2          : str
+    hedge_ratio      : float    β from OLS (estimated on training data)
+    transaction_cost : float    cost per leg per trade (default from config)
 
     Returns
     -------
-    results_df  : pd.DataFrame  with all strategy columns
-    metrics     : dict          performance summary
+    results_df : pd.DataFrame  with all strategy columns
+    metrics    : dict          full-period performance summary
     """
     df = prices[[ticker1, ticker2]].copy()
     df["signal"] = signals
@@ -57,41 +61,76 @@ def run_backtest(
     df["ret1"] = df[ticker1].pct_change()
     df["ret2"] = df[ticker2].pct_change()
 
-    # Lag signal by 1 day  →  trade at next-day open (avoids look-ahead bias)
+    # Lag signal by 1 day → trade executes at next-day open
     df["signal_lag"] = df["signal"].shift(1).fillna(0)
 
-    # Gross pair return for a long-spread position
-    gross_return = df["ret1"] - hedge_ratio * df["ret2"]
+    # Gross pair return (long ticker1, short hedge_ratio × ticker2)
+    gross_return     = df["ret1"] - hedge_ratio * df["ret2"]
+    capital_per_unit = 1.0 + abs(hedge_ratio)
+    df["pair_return_gross"] = df["signal_lag"] * gross_return / capital_per_unit
 
-    # Normalise by total capital per unit to get return on capital
-    capital_per_unit  = 1.0 + abs(hedge_ratio)
-    df["pair_return"] = df["signal_lag"] * gross_return / capital_per_unit
+    # Transaction cost: deducted whenever the lagged position changes
+    # (2 legs × cost each time we enter, exit, or reverse)
+    position_changed  = df["signal_lag"].diff().abs() > 0
+    df["trade_cost"]  = position_changed.astype(float) * 2.0 * transaction_cost
+
+    # Net return after costs
+    df["pair_return"] = df["pair_return_gross"] - df["trade_cost"]
 
     # Cumulative growth and portfolio value
     df["cumulative_return"] = (1.0 + df["pair_return"]).cumprod()
     df["portfolio_value"]   = INITIAL_CAPITAL * df["cumulative_return"]
 
-    # ── Performance Metrics ──────────────────────────────────────────
-    valid_returns = df["pair_return"].dropna()
+    # Full-period metrics
+    metrics = period_metrics(df, df.index[0])
 
-    total_return = float(df["cumulative_return"].iloc[-1] - 1.0)
+    return df, metrics
 
-    daily_mean = valid_returns.mean()
-    daily_std  = valid_returns.std()
+
+def period_metrics(results_df: pd.DataFrame, start_date, end_date=None) -> dict:
+    """
+    Compute performance metrics for any sub-period of results_df.
+
+    Used in main.py to report training and out-of-sample periods separately.
+
+    Parameters
+    ----------
+    results_df : output DataFrame from run_backtest()
+    start_date : first date of the period (inclusive)
+    end_date   : last date of the period (inclusive); None = until end
+
+    Returns
+    -------
+    dict with total_return, annualized_sharpe, max_drawdown, num_trades
+    """
+    sub = results_df.loc[start_date:end_date] if end_date else results_df.loc[start_date:]
+
+    pv      = sub["portfolio_value"].dropna()
+    returns = sub["pair_return"].dropna()
+
+    if len(pv) < 2 or len(returns) < 2:
+        return {
+            "total_return"      : 0.0,
+            "annualized_sharpe" : 0.0,
+            "max_drawdown"      : 0.0,
+            "num_trades"        : 0,
+        }
+
+    # Return relative to the start of THIS period (not overall inception)
+    total_return = float(pv.iloc[-1] / pv.iloc[0]) - 1.0
+
+    daily_mean = returns.mean()
+    daily_std  = returns.std()
     sharpe     = (daily_mean / daily_std) * np.sqrt(252) if daily_std > 0 else 0.0
 
-    rolling_max  = df["cumulative_return"].cummax()
-    drawdown     = (df["cumulative_return"] - rolling_max) / rolling_max
-    max_drawdown = float(drawdown.min())
+    rolling_max  = pv.cummax()
+    max_drawdown = float(((pv - rolling_max) / rolling_max).min())
 
-    # Count position changes (entries + exits + reversals)
-    num_trades = int((df["signal"].diff().abs() > 0).sum())
+    num_trades = int((sub["signal"].diff().abs() > 0).sum()) if "signal" in sub.columns else 0
 
-    metrics = {
+    return {
         "total_return"      : total_return,
         "annualized_sharpe" : sharpe,
         "max_drawdown"      : max_drawdown,
         "num_trades"        : num_trades,
     }
-
-    return df, metrics

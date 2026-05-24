@@ -1,30 +1,36 @@
 """
 signals.py  —  Compute spread, rolling z-score, and entry/exit signals.
 
-Logic
------
-Spread   =  ticker1  −  β·ticker2  −  α
-           Under cointegration this is stationary (mean-reverting).
+New in v2
+---------
+Stop-loss: if a position moves further against us beyond STOP_LOSS_Z
+(instead of reverting), we cut immediately rather than waiting.
 
-Z-score  =  (spread − rolling_mean) / rolling_std
-           Standardises the spread so entry/exit thresholds are scale-free.
+  Long  spread entered at z = -2.5 → stop out if z drops below -3.5
+  Short spread entered at z = +2.5 → stop out if z rises above +3.5
 
-Signals
--------
-  z > +ENTRY  →  spread overvalued  →  SHORT spread  (signal = -1)
-  z < -ENTRY  →  spread undervalued →  LONG  spread  (signal = +1)
-  Flat otherwise.
+This prevents runaway losses when the cointegration relationship
+temporarily breaks down.
 
-Exit
-----
-  Long  position: exit when z reverts back above  -EXIT_THRESHOLD
-  Short position: exit when z reverts back below  +EXIT_THRESHOLD
+Signal logic summary
+--------------------
+  z > +ENTRY  →  short spread  (signal = -1)
+  z < -ENTRY  →  long  spread  (signal = +1)
+  flat otherwise
+
+Exit (long spread):
+  z >= -EXIT_THRESHOLD  →  normal exit (reversion)
+  z <  -STOP_LOSS_Z     →  stop-loss exit
+
+Exit (short spread):
+  z <=  EXIT_THRESHOLD  →  normal exit (reversion)
+  z >   STOP_LOSS_Z     →  stop-loss exit
 """
 
 import numpy as np
 import pandas as pd
 
-from config import ZSCORE_WINDOW, ENTRY_THRESHOLD, EXIT_THRESHOLD
+from config import ZSCORE_WINDOW, ENTRY_THRESHOLD, EXIT_THRESHOLD, STOP_LOSS_Z
 
 
 def compute_spread(
@@ -38,6 +44,10 @@ def compute_spread(
     Compute the cointegration spread.
 
     spread = ticker1 − β·ticker2 − α
+
+    Under cointegration this series is stationary (mean-reverting).
+    The hedge ratio β and intercept α are estimated from the TRAINING
+    period only (v2 improvement over v1).
     """
     spread = prices[ticker1] - hedge_ratio * prices[ticker2] - intercept
     spread.name = "spread"
@@ -53,25 +63,33 @@ def compute_zscore(
 
     z = (spread − μ_rolling) / σ_rolling
 
-    First `window` values will be NaN (insufficient history).
+    First `window` values are NaN (insufficient history for rolling stats).
     """
-    mu    = spread.rolling(window=window).mean()
-    sigma = spread.rolling(window=window).std()
+    mu     = spread.rolling(window=window).mean()
+    sigma  = spread.rolling(window=window).std()
     zscore = (spread - mu) / sigma
     zscore.name = "zscore"
     return zscore
 
 
-def generate_signals(zscore: pd.Series) -> pd.Series:
+def generate_signals(
+    zscore: pd.Series,
+    stop_loss_z: float = STOP_LOSS_Z,
+) -> pd.Series:
     """
     Convert z-score series into position signals (+1 / -1 / 0).
 
-    Iterates day-by-day to apply stateful entry/exit rules.
+    Applies stateful entry, exit, and stop-loss rules day-by-day.
     NaN z-scores (warm-up period) → signal = 0.
+
+    Parameters
+    ----------
+    zscore      : rolling z-score series
+    stop_loss_z : cut position if |z| exceeds this against the trade
 
     Returns
     -------
-    pd.Series of float  (+1, -1, or 0)
+    pd.Series of float  (+1 long spread, -1 short spread, 0 flat)
     """
     signals  = pd.Series(0.0, index=zscore.index)
     position = 0
@@ -85,17 +103,21 @@ def generate_signals(zscore: pd.Series) -> pd.Series:
 
         if position == 0:
             if z > ENTRY_THRESHOLD:
-                position = -1          # spread too high → short it
+                position = -1              # spread overvalued → short it
             elif z < -ENTRY_THRESHOLD:
-                position = 1           # spread too low  → long it
+                position = 1               # spread undervalued → long it
 
-        elif position == 1:            # long spread, waiting for reversion upward
-            if z >= -EXIT_THRESHOLD:   # z has crossed back above -EXIT band
-                position = 0
+        elif position == 1:                # long spread: entered when z was very negative
+            if z >= -EXIT_THRESHOLD:
+                position = 0              # normal exit — z reverted toward zero
+            elif z < -stop_loss_z:
+                position = 0              # stop-loss — spread kept diverging
 
-        elif position == -1:           # short spread, waiting for reversion downward
-            if z <= EXIT_THRESHOLD:    # z has crossed back below +EXIT band
-                position = 0
+        elif position == -1:              # short spread: entered when z was very positive
+            if z <= EXIT_THRESHOLD:
+                position = 0              # normal exit — z reverted toward zero
+            elif z > stop_loss_z:
+                position = 0              # stop-loss — spread kept diverging
 
         signals.iloc[i] = position
 
