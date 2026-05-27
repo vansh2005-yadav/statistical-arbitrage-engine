@@ -1,113 +1,75 @@
-# Statistical Arbitrage Engine — v1
+# Statistical Arbitrage Engine — v2
 
-A clean Python implementation of a pairs trading strategy using Engle-Granger cointegration. This is **v1 of a progressive project** — each version adds a real conceptual upgrade, not just more code.
-
----
-
-## What This Does
-
-Identifies a cointegrated pair of assets (GLD / GDX), models their long-run equilibrium relationship, and trades mean-reversion of the spread when it deviates significantly.
-
-**Pipeline:**
-```
-Real price data (Yahoo Finance)
-        ↓
-Engle-Granger cointegration test
-        ↓
-OLS hedge ratio  →  spread  →  rolling z-score
-        ↓
-Entry/exit signals  (+1 / -1 / 0)
-        ↓
-Daily-bar backtest  →  Sharpe, drawdown, P&L
-        ↓
-4-panel results chart
-```
+Pairs trading strategy on GLD/GDX, built in Python. This is the second version of a progressive project — each version fixes something real that the previous one got wrong.
 
 ---
 
-## Setup
+## What this does
 
-**Requirements:** Python 3.10+
+Takes two ETFs that historically move together (GLD and GDX — both driven by gold prices), models the relationship between them, and trades when they drift too far apart on the assumption they'll revert back.
+
+The core idea: if GLD gets expensive relative to GDX, short GLD and long GDX. Wait for the gap to close. Exit.
+
+---
+
+## What changed from v1
+
+v1 had a fundamental problem — the hedge ratio (how many units of GDX offset one unit of GLD) was estimated on the full dataset, then the strategy was tested on that same dataset. That's not a real backtest. The model was essentially fitted to its own test.
+
+v2 fixes this properly:
+
+**Walk-forward validation** — the hedge ratio is now estimated on the first 60% of data only. All performance numbers come from the remaining 40% that the model never saw during calibration. This is the minimum bar for taking a backtest seriously.
+
+**Transaction costs** — v1 assumed you could trade for free. v2 deducts 10 basis points per leg on every entry and exit, which is realistic for liquid ETFs. This hits overtrading strategies hard and forces the signals to actually earn their keep.
+
+**Stop-loss** — cointegration is a long-run property and it can break temporarily. If the spread keeps moving against the position past z = ±3.5 instead of reverting, v2 cuts the loss immediately rather than holding and hoping.
+
+---
+
+## How to run
 
 ```bash
-# Clone and navigate into the folder
-git clone <repo-url>
-cd stat_arb_v1
-
-# Install dependencies
 pip install -r requirements.txt
-```
-
----
-
-## Run
-
-```bash
 python main.py
 ```
 
-**Output:**
-- Live console report (cointegration stats, signal counts, performance summary)
-- `results.png` — 4-panel chart: prices, spread, z-score, portfolio value
+You'll get a console summary showing training-period performance vs out-of-sample performance side by side, and a `results.png` with the train/test boundary clearly marked on all four panels.
 
 ---
 
-## Project Structure
+## File structure
 
 ```
-stat_arb_v1/
-├── config.py           # all parameters (pair, dates, thresholds, capital)
-├── data.py             # Yahoo Finance data fetch via yfinance
-├── cointegration.py    # Engle-Granger test + OLS hedge ratio
-├── signals.py          # spread, rolling z-score, entry/exit signals
-├── backtest.py         # daily-bar simulation, Sharpe, drawdown
-├── plot.py             # 4-panel matplotlib chart
-├── main.py             # entry point — runs the full pipeline
-└── requirements.txt
+├── config.py           — all parameters in one place
+├── data.py             — price fetch + train/test split
+├── cointegration.py    — Engle-Granger test, OLS hedge ratio
+├── signals.py          — spread, z-score, entry/exit/stop-loss signals
+├── backtest.py         — simulation with transaction costs, period metrics
+├── plot.py             — 4-panel chart with train/OOS split marked
+└── main.py             — runs the full pipeline
 ```
 
 ---
 
-## Key Concepts (v1)
+## Parameters
 
-| Concept | Implementation |
+Everything is in `config.py`. The ones that matter most:
+
+| Parameter | Value | Why |
+|---|---|---|
+| `TRAIN_RATIO` | 0.60 | 60% for estimation, 40% for real testing |
+| `ENTRY_THRESHOLD` | 2.0 | Enter when spread is 2 standard deviations off |
+| `EXIT_THRESHOLD` | 0.5 | Exit when it's mostly reverted |
+| `STOP_LOSS_Z` | 3.5 | Cut if it keeps going the wrong way |
+| `TRANSACTION_COST` | 0.001 | 10 bps per leg — realistic for ETFs |
+
+---
+
+## Versions
+
+| | |
 |---|---|
-| Cointegration | Engle-Granger two-step test (`statsmodels.tsa.stattools.coint`) |
-| Hedge ratio | OLS regression: `ticker1 = α + β·ticker2 + ε` |
-| Spread | `ticker1 − β·ticker2 − α` |
-| Z-score | Rolling 30-day standardisation of spread |
-| Entry | `|z| > 2.0` |
-| Exit | `|z| < 0.5` (from same side) |
-| Sizing | Approximate dollar-neutral, no leverage |
-| Look-ahead | Signal lagged 1 day before trade execution |
-
----
-
-## Pair: GLD / GDX
-
-- **GLD** — SPDR Gold ETF (tracks spot gold)
-- **GDX** — VanEck Gold Miners ETF (tracks gold mining companies)
-
-Both assets are driven by the underlying gold price, making them a canonical cointegrated pair used widely in academic and practitioner literature.
-
----
-
-## Roadmap
-
-| Version | Additions |
-|---|---|
-| **v1** (this) | Basic EG cointegration, z-score signals, simple backtest |
-| **v2** | Proper backtesting framework, transaction costs, position sizing |
-| **v3** | Kalman filter for dynamic hedge ratio, regime detection |
-| **v4** | Multi-pair, risk management, production-level structure |
-
----
-
-## Limitations (v1 — intentional)
-
-- Static hedge ratio (estimated once on full sample — in-sample bias)
-- No transaction costs or slippage
-- Single pair only
-- No regime awareness (trades through volatile periods)
-
-These are addressed in later versions.
+| v1 | Basic cointegration, z-score signals, simple backtest |
+| v2 (this) | Walk-forward validation, transaction costs, stop-loss |
+| v3 | Kalman filter for dynamic hedge ratio, regime detection |
+| v4 | Multi-pair, portfolio-level risk, production structure |
